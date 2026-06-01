@@ -1,0 +1,15 @@
+{
+  "name": "stock-console",
+  "version": "1.0.0",
+  "description": "Console stock quote lookup tool",
+  "type": "module",
+  "bin": {
+    "stock": "./bin/stock.js"
+  },
+  "scripts": {
+    "stock": "node ./bin/stock.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
