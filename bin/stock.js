@@ -19,6 +19,8 @@ const HELP = `
   stock <股票代码...>          查询指定股票，例如: stock 600519 AAPL 00700.HK
   stock                       查询自选股；如果没有自选股则进入交互模式
   stock add <股票代码...>      添加自选股
+  stock add <中文名称...>      按中文名称搜索并添加自选股
+  stock search <中文名称>      按中文名称搜索股票代码
   stock remove <股票代码...>   删除自选股
   stock list                  查看自选股
   stock clear                 清空自选股
@@ -44,6 +46,11 @@ async function main() {
 
     if (command === 'add') {
       await addSymbols(rest);
+      return;
+    }
+
+    if (command === 'search') {
+      await searchSymbols(rest);
       return;
     }
 
@@ -104,19 +111,55 @@ async function getDefaultSymbols() {
 
 async function addSymbols(symbols) {
   if (symbols.length === 0) {
-    throw new Error('请提供要添加的股票代码。');
+    throw new Error('请提供要添加的股票代码或中文名称。');
   }
 
   const current = await loadWatchlist();
   const map = new Map(current.map((item) => [item.key, item]));
+  const added = [];
 
   for (const inputSymbol of symbols) {
-    const parsed = normalizeSymbol(inputSymbol);
-    map.set(parsed.key, { key: parsed.key, input: inputSymbol });
+    const resolved = await resolveSymbolInput(inputSymbol);
+    if (resolved.needsConfirmation) {
+      const confirmed = await confirmResolvedSymbol(inputSymbol, resolved.matches);
+      if (!confirmed) continue;
+      map.set(confirmed.key, { key: confirmed.key, input: confirmed.input });
+      added.push(formatResolvedSymbol(confirmed));
+      continue;
+    }
+
+    map.set(resolved.key, { key: resolved.key, input: resolved.input });
+    added.push(formatResolvedSymbol(resolved));
+  }
+
+  if (added.length === 0) {
+    console.log('未添加任何自选股。');
+    return;
   }
 
   await saveWatchlist([...map.values()]);
-  console.log(`已添加: ${symbols.join(', ')}`);
+  console.log(`已添加: ${added.join(', ')}`);
+}
+
+async function searchSymbols(terms) {
+  const keyword = terms.join(' ').trim();
+  if (!keyword) {
+    throw new Error('请提供要搜索的中文名称。');
+  }
+
+  const results = await fetchSymbolSearch(keyword);
+  if (results.length === 0) {
+    console.log(`没有找到匹配 "${keyword}" 的股票。`);
+    return;
+  }
+
+  console.table(results.map((item, index) => ({
+    '#': index + 1,
+    名称: item.name,
+    代码: item.input,
+    市场: item.market,
+    类型: item.type
+  })));
 }
 
 async function removeSymbols(symbols) {
@@ -246,6 +289,128 @@ async function fetchQuotes(symbols) {
     .filter(Boolean)
     .map(parseTencentLine)
     .filter(Boolean);
+}
+
+async function resolveSymbolInput(inputSymbol) {
+  try {
+    const parsed = normalizeSymbol(inputSymbol);
+    return { ...parsed, input: inputSymbol };
+  } catch (error) {
+    if (!isLikelyChineseName(inputSymbol)) throw error;
+  }
+
+  const matches = await fetchSymbolSearch(inputSymbol);
+  if (matches.length === 0) {
+    throw new Error(`没有找到名称匹配的股票: ${inputSymbol}`);
+  }
+
+  return { needsConfirmation: true, matches };
+}
+
+async function confirmResolvedSymbol(keyword, matches) {
+  console.log(`"${keyword}" 搜索结果:`);
+  console.table(matches.map((item, index) => ({
+    '#': index + 1,
+    名称: item.name,
+    代码: item.input,
+    市场: item.market,
+    类型: item.type
+  })));
+
+  const defaultIndex = findDefaultSearchIndex(keyword, matches);
+  const hint = defaultIndex === -1 ? '输入序号确认添加，或输入 q 跳过: ' : `回车添加 #${defaultIndex + 1}，输入序号选择其它结果，或输入 q 跳过: `;
+  const rl = readline.createInterface({ input, output });
+
+  try {
+    while (true) {
+      const answer = (await rl.question(hint)).trim();
+      if (!answer && defaultIndex !== -1) return matches[defaultIndex];
+      if (['q', 'quit', 'exit', 'n', 'no'].includes(answer.toLowerCase())) return null;
+
+      const index = Number(answer);
+      if (Number.isInteger(index) && index >= 1 && index <= matches.length) {
+        return matches[index - 1];
+      }
+
+      console.log(`请输入 1 到 ${matches.length} 的序号，或输入 q 跳过。`);
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+function findDefaultSearchIndex(keyword, matches) {
+  const exactIndex = matches.findIndex((item) => item.name === keyword);
+  if (exactIndex !== -1) return exactIndex;
+  return matches.length === 1 ? 0 : -1;
+}
+
+async function fetchSymbolSearch(keyword) {
+  const normalizedKeyword = String(keyword).trim();
+  if (!normalizedKeyword) return [];
+
+  const url = `https://smartbox.gtimg.cn/s3/?t=all&q=${encodeURIComponent(normalizedKeyword)}`;
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'stock-console/1.0'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`搜索接口返回 HTTP ${response.status}`);
+  }
+
+  const body = decodeTencentText(await response.arrayBuffer());
+  return parseTencentSearch(body);
+}
+
+function parseTencentSearch(body) {
+  const match = String(body).match(/^v_hint="(.*)"\s*;?$/);
+  if (!match || match[1] === 'N') return [];
+  const payload = decodeEscapedTencentString(match[1]);
+
+  return payload
+    .split('^')
+    .map((item) => item.split('~'))
+    .filter((fields) => fields.length >= 5)
+    .map(([market, code, name, pinyin, type]) => {
+      const normalizedMarket = market.toLowerCase();
+      const normalizedCode = normalizedMarket === 'us' ? code.toUpperCase() : code;
+      const key = `${normalizedMarket}${normalizedCode}`;
+      return {
+        market: normalizedMarket,
+        code: normalizedCode,
+        key,
+        tencentCode: key,
+        name,
+        pinyin,
+        type,
+        input: formatSearchInput(normalizedMarket, normalizedCode)
+      };
+    })
+    .filter((item) => MARKET_PREFIXES.has(item.market));
+}
+
+function decodeEscapedTencentString(value) {
+  try {
+    return JSON.parse(`"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\\\\u/g, '\\u')}"`);
+  } catch {
+    return value;
+  }
+}
+
+function formatSearchInput(market, code) {
+  if (market === 'hk') return `${code}.HK`;
+  if (market === 'us') return code;
+  return code;
+}
+
+function formatResolvedSymbol(symbol) {
+  return symbol.name ? `${symbol.name}(${symbol.input})` : symbol.input;
+}
+
+function isLikelyChineseName(value) {
+  return /[\u4e00-\u9fff]/.test(String(value));
 }
 
 function decodeTencentText(arrayBuffer) {
